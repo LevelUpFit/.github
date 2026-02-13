@@ -56,6 +56,104 @@ Storage: 분석 전/후 영상 및 데이터 보존 (MinIO)
 
 ---
 
+# 🔥 Key Challenges & Solutions (Technical Deep Dive)
+
+### 1. 이기종 서버 간의 비동기 Multipart 데이터 통신 최적화
+* **Challenge**: Spring Boot 서버에서 관리하는 비즈니스 메타데이터와 사용자가 업로드한 대용량 영상 파일을 Python AI 서버로 전송할 때, 파일 데이터가 유실되거나 동기식 처리로 인한 스레드 차단 병목 현상이 발생할 위험이 있었습니다.
+* **Solution**: `WebClient`를 활용한 논블로킹 통신을 구축하고, `MultipartBodyBuilder`를 통해 데이터를 구조화했습니다. 특히 `ByteArrayResource`를 상속받아 `getFilename()`을 오버라이드함으로써 멀티파트 전송 시 파일명이 Null로 처리되는 문제를 해결하고, AI 분석 결과(`FeedbackresultDTO`)를 비동기 Mono 객체로 수신하여 자원 효율성을 극대화했습니다.
+
+```java
+// FastApiWebClientService.java
+public Mono<FeedbackresultDTO> sendToFastApi(ExerciseFeedbackRequest request) throws IOException {
+    MultipartBodyBuilder builder = new MultipartBodyBuilder();
+    MultipartFile video = request.getVideo();
+    byte[] bytes = video.getBytes();
+
+    // 파일명 유실 방지를 위한 Resource 커스텀 구현
+    ByteArrayResource videoResource = new ByteArrayResource(bytes) {
+        @Override
+        public String getFilename() {
+            return video.getOriginalFilename();
+        }
+    };
+    
+    builder.part("file", videoResource)
+            .header("Content-Disposition", "form-data; name=file; filename=" + video.getOriginalFilename());
+    builder.part("exercise_id", request.getExerciseId());
+    builder.part("feedback_id", request.getFeedbackId());
+
+    return webClient.post()
+            .uri(poseUrl)
+            .contentType(MediaType.MULTIPART_FORM_DATA)
+            .bodyValue(builder.build())
+            .retrieve()
+            .bodyToMono(FeedbackresultDTO.class);
+}
+```
+
+---
+
+### 2. WebSocket 기반 실시간 알림 및 세션 생명주기 관리
+* **Challenge**: AI 영상 분석은 고부하 작업으로 수 초 이상의 시간이 소요되므로, 사용자가 분석 완료 시점을 실시간으로 인지하지 못하면 서비스 이탈이나 반복적인 요청이 발생할 수 있는 UX적 한계가 있었습니다.
+* **Solution**: `ConcurrentHashMap`을 이용해 세션을 ID 단위로 관리하는 `FeedbackWebSocketHandler`를 구현했습니다. 분석 서버로부터 결과를 수신한 즉시 해당 세션에 `FEEDBACK_ANALYSIS_COMPLETE` 메시지를 푸시하고, 전송 직후 세션을 명시적으로 종료(`session.close()`)하여 서버의 커넥션 유지 비용을 절감하고 실시간성을 확보했습니다.
+
+```java
+// FeedbackWebSocketHandler.java
+public void sendAnalysisCompleteMessage(int feedbackId) {
+    WebSocketSession session = sessionMap.get(feedbackId);
+    if (session != null && session.isOpen()) {
+        try {
+            // 분석 완료 JSON 메시지 푸시
+            String message = String.format("{\"type\": \"FEEDBACK_ANALYSIS_COMPLETE\", \"feedbackId\": %d}", feedbackId);
+            session.sendMessage(new TextMessage(message));
+            session.close(); // 자원 효율화를 위한 세션 즉시 종료
+        } catch (IOException e) {
+            logger.error("WebSocket 전송 실패: feedbackId={}", feedbackId, e);
+        }
+    }
+}
+```
+
+---
+
+### 3. MediaPipe 및 지수 함수 기반의 정밀 자세 평가 알고리즘
+* **Challenge**: 관절 좌표 데이터만으로는 "올바른 자세"에 대한 객관적 기준을 수치화하기 어려웠으며, 미세한 떨림과 심각한 자세 붕괴를 구분할 변별력이 필요했습니다.
+* **Solution**: `calc_penalty` 알고리즘에 지수 함수(Exponential Function)를 도입했습니다. 무릎이 발끝을 넘어서는 임계치(Threshold)를 기준으로 거리가 멀어질수록 패널티를 가중시켜, 자세가 불안정해질수록 정확도 점수가 급격히 하락하게 설계함으로써 분석 결과의 신뢰도를 높였습니다.
+
+```python
+# lunge_analyzer_level3.py
+def calc_penalty(over_distance, threshold=10, max_penalty=100):
+    x = max(0, over_distance)
+    # 거리 증가에 따른 패널티 가중치 부여 (지수 함수 적용)
+    exp_input = min((x / threshold) ** 2, 10)
+    penalty = math.exp(exp_input) - 1
+    return min(penalty, max_penalty)
+
+# 앞다리 정렬 판별 및 패널티 산출
+over_distance = max(0, knee_x - foot_x) if look_direction == "right" else max(0, foot_x - knee_x)
+penalty = calc_penalty(over_distance) if over_distance > 0 else 0
+```
+
+---
+
+### 4. FFmpeg를 활용한 웹 스트리밍 최적화 (faststart)
+* **Challenge**: AI 분석 결과로 생성된 MP4 파일이 브라우저에서 스트리밍될 때, 메타데이터(moov atom)가 파일 끝에 위치하여 영상 전체가 다운로드되기 전까지 재생이 시작되지 않는 지연 현상이 발생했습니다.
+* **Solution**: `FFmpeg` 라이브러리를 연동하여 인코딩 파이프라인을 구축했습니다. 특히 `-movflags +faststart` 옵션을 적용하여 동영상 헤더 정보를 파일 앞부분으로 배치함으로써, 네트워크 환경에 관계없이 사용자가 분석 영상을 즉시 확인할 수 있도록 스트리밍 성능을 개선했습니다.
+
+```python
+# lunge_analyzer_level3.py
+try:
+    # libx264 코덱 인코딩 및 스트리밍 최적화 플래그 적용
+    subprocess.run([
+        'ffmpeg', '-i', output_path,
+        '-c:v', 'libx264',
+        '-movflags', '+faststart', # 웹 재생 최적화의 핵심
+        '-y',
+        optimized_path
+    ], check=True, capture_output=True)
+except subprocess.CalledProcessError as e:
+    print(f"FFmpeg 최적화 실패: {e.stderr.decode()}")
+```
 
 ## 👥 Contributors
 
