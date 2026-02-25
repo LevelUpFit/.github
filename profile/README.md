@@ -45,7 +45,8 @@ AI 모델을 사용하여 운동 영상을 분석하고 정밀한 데이터를 �
 ---
 
 ## 🏗 System Architecture
-<img width="954" height="560" alt="수정 2  개발구성도" src="https://github.com/user-attachments/assets/cffa1401-d485-44e7-b2c3-a29aad07607f" />
+<img width="2344" height="1824" alt="image" src="https://github.com/user-attachments/assets/c11f5d51-bb16-40b1-9c15-ca348b560b16" />
+
 
 
 Main Server: 사용자 관리 및 루틴 도메인 로직 담당 (RDBMS 활용)
